@@ -30,6 +30,7 @@ import multiprocessing
 import os
 import platform
 import re
+import signal
 import sys
 import wildcard_iterator
 import xml.dom.minidom
@@ -45,10 +46,10 @@ from gslib.name_expansion import NameExpansionIteratorQueue
 from gslib.project_id import ProjectIdHandler
 from gslib.storage_uri_builder import StorageUriBuilder
 from gslib.thread_pool import ThreadPool
-from gslib.util import HAVE_OAUTH2
+from gslib.util import IS_WINDOWS
 from gslib.util import NO_MAX
-
 from gslib.wildcard_iterator import ContainsWildcard
+from oauth2client.client import HAS_CRYPTO
 
 
 def _ThreadedLogger():
@@ -396,7 +397,6 @@ class Command(object):
         self.command_name, self.proj_id_handler, self.headers, self.debug,
         self.bucket_storage_uri_class, uri_args, self.recursion_requested,
         self.recursion_requested, all_versions=self.all_versions)
-
     # Perform requests in parallel (-m) mode, if requested, using
     # configured number of parallel processes and threads. Otherwise,
     # perform requests with sequential function calls in current process.
@@ -427,6 +427,25 @@ class Command(object):
             uri.set_xml_acl(acl_arg, uri.object_name, False, self.headers)
     if not some_matched:
       raise CommandException('No URIs matched')
+    
+  def _WarnServiceAccounts(self):
+    """Warns service account users who have received an AccessDenied error for
+    one of the metadata-related commands to make sure that they are listed as 
+    Owners in the API console."""
+    
+    # Import this here so that the value will be set first in oauth2_plugin.
+    from gslib.third_party.oauth2_plugin.oauth2_plugin import IS_SERVICE_ACCOUNT
+    
+    if IS_SERVICE_ACCOUNT:
+      # This method is only called when canned ACLs are used, so the warning
+      # definitely applies.
+      print('It appears that your service account has been denied access while'
+            '\nattemptingto perform a metadata operation. If you believe that\n'
+            'you should have access to this metadata (i.e., if it is associated'
+            '\nwith your account), please make sure that your service '
+            'account''s\nemail address is listed as an Owner in the Team tab of'
+            ' the API console.\nSee "gsutil help creds" for further '
+            'information.\n')
 
   def GetAclCommandHelper(self):
     """Common logic for getting ACLs. Gets the standard ACL or the default
@@ -520,7 +539,7 @@ class Command(object):
       self.THREADED_LOGGER.info('thread count: %d', thread_count)
 
     if self.parallel_operations and process_count > 1:
-      procs = []
+      self.procs = []
       # If any shared attributes passed by caller, create a dictionary of
       # shared memory variables for every element in the list of shared
       # attributes.
@@ -546,8 +565,12 @@ class Command(object):
                                     args=(func, work_queue, shard,
                                           thread_count, thr_exc_handler,
                                           shared_vars))
-        procs.append(p)
+        self.procs.append(p)
         p.start()
+
+      # Catch ^C under Linux/MacOs so we can kill the suprocesses.
+      if not IS_WINDOWS:
+        signal.signal(signal.SIGINT, self._HandleMultiProcessingControlC)
 
       last_name_expansion_result = None
       try:
@@ -570,7 +593,7 @@ class Command(object):
 
         # Wait for all spawned OS processes to finish.
         failed_process_count = 0
-        for p in procs:
+        for p in self.procs:
           p.join()
           # Count number of procs that returned non-zero exit code.
           if p.exitcode != 0:
@@ -599,6 +622,18 @@ class Command(object):
                                               _EOF_NAME_EXPANSION_RESULT)
       self._ApplyThreads(func, work_queue, 0, thread_count, thr_exc_handler,
                          None)
+
+  def _HandleMultiProcessingControlC(self, signal_num, cur_stack_frame):
+    """Called when user hits ^C during a multi-processing/multi-threaded
+       request, so we can kill the suprocesses."""
+    # Note: This only works under Linux/MacOS. See
+    # https://github.com/GoogleCloudPlatform/gsutil/issues/99 for details
+    # about why making it work correctly across OS's is harder and still open.
+    for proc in self.procs:
+      os.kill(proc.pid, signal.SIGKILL)
+    sys.stderr.write('Caught ^C - exiting\n')
+    # Simply calling sys.exit(1) doesn't work - see above bug for details.
+    os.kill(os.getpid(), signal.SIGKILL)
 
   def HaveFileUris(self, args_to_check):
     """Checks whether args_to_check contain any file URIs.
@@ -637,18 +672,19 @@ class Command(object):
     config = boto.config
     if not util.HasConfiguredCredentials():
       if self.config_file_list:
-        if (config.has_option('Credentials', 'gs_oauth2_refresh_token')
-            and not HAVE_OAUTH2):
+        if (config.has_option('Credentials', 'gs_service_client_id')
+            and not HAS_CRYPTO):
           raise CommandException(
-              'Your gsutil is configured with OAuth2 authentication '
-              'credentials.\nHowever, OAuth2 is only supported when running '
-              'under Python 2.6 or later\n(unless additional dependencies are '
-              'installed, see README for details); you are running Python %s.' %
-              sys.version)
+              'Your gsutil is configured with an OAuth2 service account,\nbut '
+              'you do not have PyOpenSSL or PyCrypto 2.6 or later installed.\n'
+              'Service account authentication requires one of these '
+              'libraries;\nplease install either of them to proceed, or '
+              'configure \na different type of credentials with'
+              '"gsutil config".')
         raise CommandException('You have no storage service credentials in any '
                                'of the following boto config\nfiles. Please '
                                'add your credentials as described in the '
-                               'gsutil README file, or else\nre-run '
+                               'gsutil README.md file, or else\nre-run '
                                '"gsutil config" to re-create a config '
                                'file:\n%s' % self.config_file_list)
       else:

@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
 import sys
 
 from gslib.command import Command
@@ -42,7 +43,7 @@ _detailed_help_text = ("""
 
 <B>DESCRIPTION</B>
   The cat command outputs the contents of one or more URIs to stdout.
-  It is equivalent to doing:
+  It is equivalent to doing::
 
     gsutil cp uri... -
 
@@ -50,8 +51,29 @@ _detailed_help_text = ("""
 
 
 <B>OPTIONS</B>
-  -h          Prints short header for each object. For example:
+  -h          Prints short header for each object. For example::
+
                 gsutil cat -h gs://bucket/meeting_notes/2012_Feb/*.txt
+
+  -r range    Causes gsutil to output just the specified byte range of the
+              object. Ranges are can be of these forms::
+
+                start-end (e.g., -r 256-5939)
+                start-    (e.g., -r 256-)
+                -numbytes (e.g., -r -5)
+
+              where offsets start at 0, start-end means to return bytes start
+              through end (inclusive), start- means to return bytes start
+              through the end of the object, and -numbytes means to return the
+              last numbytes of the object. For example::
+
+                gsutil cat -r 256-939 gs://bucket/object
+
+              returns bytes 256 through 939, while::
+
+                gsutil cat -r -5 gs://bucket/object
+
+              returns the final 5 bytes of the object.
 """)
 
 
@@ -69,7 +91,7 @@ class CatCommand(Command):
     # Max number of args required by this command, or NO_MAX.
     MAX_ARGS : NO_MAX,
     # Getopt-style string specifying acceptable sub args.
-    SUPPORTED_SUB_ARGS : 'hv',
+    SUPPORTED_SUB_ARGS : 'hvr:',
     # True if file URIs acceptable for this command.
     FILE_URIS_OK : False,
     # True if provider-only URIs acceptable for this command.
@@ -95,10 +117,15 @@ class CatCommand(Command):
   # Command entry point.
   def RunCommand(self):
     show_header = False
+    range = None
     if self.sub_opts:
-      for o, unused_a in self.sub_opts:
+      for o, a in self.sub_opts:
         if o == '-h':
           show_header = True
+        elif o == '-r':
+          range = a.strip()
+          if not re.match('^[0-9]+-[0-9]*$|^-[0-9]+$', range):
+            raise CommandException('Invalid range (%s)' % range)
         elif o == '-v':
           self.THREADED_LOGGER.info('WARNING: The %s -v option is no longer'
                                     ' needed, and will eventually be removed.\n'
@@ -123,7 +150,10 @@ class CatCommand(Command):
           print '==> %s <==' % uri.__str__()
           printed_one = True
         key = uri.get_key(False, self.headers)
-        key.get_file(cat_outfd, self.headers)
+        headers = self.headers.copy()
+        if range:
+          headers['range'] = 'bytes=%s' % range
+        key.get_file(cat_outfd, headers)
     sys.stdout = cat_outfd
     if not did_some_work:
       raise CommandException('No URIs matched')

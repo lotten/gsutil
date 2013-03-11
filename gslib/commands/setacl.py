@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from boto.exception import GSResponseError
 from gslib.command import Command
 from gslib.command import COMMAND_NAME
 from gslib.command import COMMAND_NAME_ALIASES
@@ -38,11 +39,11 @@ _detailed_help_text = ("""
 <B>DESCRIPTION</B>
   The setacl command allows you to set an Access Control List on one or
   more buckets and objects. The simplest way to use it is to specify one of
-  the canned ACLs, e.g.,:
+  the canned ACLs, e.g.,::
 
     gsutil setacl private gs://bucket
 
-  or:
+  or::
 
     gsutil setacl public-read gs://bucket/object
 
@@ -51,20 +52,20 @@ _detailed_help_text = ("""
   If you want to define more fine-grained control over your data, you can
   retrieve an ACL using the getacl command (see "gsutil help getacl"),
   save the output to a file, edit the file, and then use the gsutil setacl
-  command to set that ACL on the buckets and/or objects. For example:
+  command to set that ACL on the buckets and/or objects. For example::
 
     gsutil getacl gs://bucket/file.txt > acl.txt
     (Make changes to acl.txt such as adding an additional grant.)
     gsutil setacl acl.txt gs://cats/file.txt
 
   Note that you can set an ACL on multiple buckets or objects at once,
-  for example:
+  for example::
 
     gsutil setacl acl.txt gs://bucket/*.jpg
 
   If you have a large number of ACLs to update you might want to use the
   gsutil -m option, to perform a parallel (multi-threaded/multi-processing)
-  update:
+  update::
 
     gsutil -m setacl acl.txt gs://bucket/*.jpg
 
@@ -134,5 +135,11 @@ class SetAclCommand(Command):
           self.THREADED_LOGGER.info('WARNING: The %s -v option is no longer'
                                     ' needed, and will eventually be removed.\n'
                                     % self.command_name)
-    self.SetAclCommandHelper()
+    try:
+      self.SetAclCommandHelper()
+    except GSResponseError as e:
+      if e.code == 'AccessDenied' and e.reason == 'Forbidden' \
+          and e.status == 403:
+        self._WarnServiceAccounts()
+      raise
     return 0
